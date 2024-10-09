@@ -7,8 +7,10 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <sys/select.h>
+#include <errno.h>
 
 #define BUFFER_SIZE 1024
+#define MAX_BUFFER_SIZE 8192  // Maximum size for the receive buffer
 
 // Function to set stdin to non-blocking
 void set_nonblocking(int fd) {
@@ -24,7 +26,8 @@ int validate_nickname(const char *nickname) {
     // Compile regex for nickname (A-Za-z0-9_)
     reti = regcomp(&regex, "^[A-Za-z0-9_]{1,12}$", REG_EXTENDED);
     if (reti) {
-        fprintf(stderr, "Could not compile regex\n");
+        fprintf(stderr, "ERROR Could not compile regex\n");
+        fflush(stderr);
         exit(EXIT_FAILURE);
     }
 
@@ -38,7 +41,8 @@ int validate_nickname(const char *nickname) {
 
 int main(int argc, char *argv[]) {
     if (argc != 3) {
-        fprintf(stderr, "Usage: %s <IP:PORT> <NICKNAME>\n", argv[0]);
+        fprintf(stderr, "ERROR Usage: %s <IP:PORT> <NICKNAME>\n", argv[0]);
+        fflush(stderr);
         exit(EXIT_FAILURE);
     }
 
@@ -47,59 +51,59 @@ int main(int argc, char *argv[]) {
     char *ip = strtok(ip_port, ":");
     char *port_str = strtok(NULL, ":");
     if (!ip || !port_str) {
-        fprintf(stderr, "Invalid IP:PORT format\n");
+        fprintf(stderr, "ERROR Invalid IP:PORT format\n");
+        fflush(stderr);
         exit(EXIT_FAILURE);
     }
     int port = atoi(port_str);
 
     // Validate nickname
     char *nickname = argv[2];
-    if (strlen(nickname) > 12) {
-        fprintf(stderr, "Invalid nickname. Must be up to 12 characters.\n");
-        exit(EXIT_FAILURE);
-    }
-    if (!validate_nickname(nickname)) {
-        fprintf(stderr, "Invalid nickname format. Only A-Za-z0-9_ allowed.\n");
+    if (strlen(nickname) > 12 || !validate_nickname(nickname)) {
+        fprintf(stderr, "ERROR Invalid nickname. Must be up to 12 characters and contain only A-Za-z0-9_.\n");
+        fflush(stderr);
         exit(EXIT_FAILURE);
     }
 
     // Resolve hostname and create socket
-    struct addrinfo hints, *res;
+    struct addrinfo hints, *res, *p;
     int sockfd;
     memset(&hints, 0, sizeof hints);
-    hints.ai_family = AF_UNSPEC; // Support IPv4 and IPv6
-    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_family = AF_UNSPEC;     // Support IPv4 and IPv6
+    hints.ai_socktype = SOCK_STREAM; // TCP stream sockets
 
     if (getaddrinfo(ip, port_str, &hints, &res) != 0) {
-        perror("getaddrinfo");
+        fprintf(stderr, "ERROR getaddrinfo: %s\n", gai_strerror(errno));
+        fflush(stderr);
         exit(EXIT_FAILURE);
     }
 
-    if ((sockfd = socket(res->ai_family, res->ai_socktype, res->ai_protocol)) == -1) {
-        perror("socket");
-        exit(EXIT_FAILURE);
+    // Try to connect to one of the addresses
+    for (p = res; p != NULL; p = p->ai_next) {
+        if ((sockfd = socket(p->ai_family, p->ai_socktype, p->ai_protocol)) == -1) {
+            continue; // Try next address
+        }
+        if (connect(sockfd, p->ai_addr, p->ai_addrlen) == -1) {
+            close(sockfd);
+            continue; // Try next address
+        }
+        break; // Successfully connected
     }
-    if (connect(sockfd, res->ai_addr, res->ai_addrlen) == -1) {
-        perror("connect");
-        close(sockfd);
+
+    if (p == NULL) {
+        fprintf(stderr, "ERROR Could not connect to server\n");
+        fflush(stderr);
+        freeaddrinfo(res);
         exit(EXIT_FAILURE);
     }
     freeaddrinfo(res);
 
+    // Connected to server
     printf("Connected to %s:%s\n", ip, port_str);
     fflush(stdout);
 
     // Set STDIN to non-blocking mode
     set_nonblocking(STDIN_FILENO);
-
-    // Set socket to non-blocking mode
-    set_nonblocking(sockfd);
-
-    // Variables to track connection state
-    int received_hello = 0;
-    int nickname_accepted = 0;
-
-    char buf[BUFFER_SIZE];
 
     // Set up select for multiplexing input/output
     fd_set master, read_fds;
@@ -111,104 +115,134 @@ int main(int argc, char *argv[]) {
 
     int fdmax = sockfd > STDIN_FILENO ? sockfd : STDIN_FILENO;
 
+    char recv_buffer[MAX_BUFFER_SIZE];
+    int recv_buffer_len = 0;
+    int logged_in = 0;
+
     // Main loop for chat
     while (1) {
         read_fds = master; // Copy the master set
 
         if (select(fdmax + 1, &read_fds, NULL, NULL, NULL) == -1) {
-            perror("select");
+            fprintf(stderr, "ERROR select: %s\n", strerror(errno));
+            fflush(stderr);
             exit(EXIT_FAILURE);
         }
 
         // Check for data from server
         if (FD_ISSET(sockfd, &read_fds)) {
+            char buf[BUFFER_SIZE];
             int numbytes = recv(sockfd, buf, sizeof(buf) - 1, 0);
             if (numbytes <= 0) {
                 if (numbytes == 0) {
                     printf("Server closed connection\n");
                 } else {
-                    perror("recv");
+                    fprintf(stderr, "ERROR recv: %s\n", strerror(errno));
+                    fflush(stderr);
                 }
                 break;
             }
-            buf[numbytes] = '\0';
 
-            // Process the message
-            if (!received_hello) {
-                // Expecting HELLO <VERSION>
-                if (strncmp(buf, "HELLO ", 6) == 0) {
-                    printf("%s", buf);
-                    fflush(stdout);
-                    received_hello = 1;
-
-                    // Send NICK command to the server
-                    snprintf(buf, sizeof buf, "NICK %s\n", nickname);
-                    send(sockfd, buf, strlen(buf), 0);
-                } else {
-                    fprintf(stderr, "Invalid greeting from server\n");
-                    exit(EXIT_FAILURE);
-                }
-            } else if (!nickname_accepted) {
-                if (strncmp(buf, "OK", 2) == 0) {
-                    printf("Nickname accepted!\n");
-                    fflush(stdout);
-                    nickname_accepted = 1;
-                } else if (strncmp(buf, "ERR", 3) == 0) {
-                    fprintf(stderr, "Server error: %s\n", buf);
-                    exit(EXIT_FAILURE);
-                } else {
-                    fprintf(stderr, "Unexpected response from server\n");
-                    exit(EXIT_FAILURE);
-                }
-            } else {
-                // Remove trailing newline characters
-                buf[strcspn(buf, "\r\n")] = '\0';
-
-                if (strncmp(buf, "MSG ", 4) == 0) {
-                    // Extract the nick
-                    char *nick_start = buf + 4;
-                    char *nick_end = strchr(nick_start, ' ');
-                    if (nick_end != NULL) {
-                        *nick_end = '\0';
-                        char *message = nick_end + 1;
-
-                        // Check if the nick is the client's own nickname
-                        if (strcmp(nick_start, nickname) != 0) {
-                            // Print messages from other users
-                            printf("%s: %s\n", nick_start, message);
-                            fflush(stdout);
-                        }
-                        // Else, do not print the message (we already have it)
-                    } else {
-                        // Invalid MSG format; print the raw message
-                        printf("%s\n", buf);
-                        fflush(stdout);
-                    }
-                } else if (strncmp(buf, "ERR", 3) == 0) {
-                    // Print error messages from server
-                    printf("%s\n", buf);
-                    fflush(stdout);
-                }
+            // Append received data to the receive buffer
+            if (recv_buffer_len + numbytes > MAX_BUFFER_SIZE - 1) {
+                fprintf(stderr, "ERROR Receive buffer overflow\n");
+                fflush(stderr);
+                exit(EXIT_FAILURE);
             }
+            memcpy(recv_buffer + recv_buffer_len, buf, numbytes);
+            recv_buffer_len += numbytes;
+            recv_buffer[recv_buffer_len] = '\0';
+
+            // Process complete messages in the buffer
+            char *line_start = recv_buffer;
+            char *newline_pos = NULL;
+            while ((newline_pos = strchr(line_start, '\n')) != NULL) {
+                *newline_pos = '\0'; // Replace newline with null terminator
+                char *message = line_start;
+
+                // Process the message
+                if (!logged_in) {
+                    // Expecting "HELLO 1" or "OK" messages
+                    if (strncmp(message, "HELLO ", 6) == 0) {
+                        // Send NICK command to the server
+                        char nick_cmd[BUFFER_SIZE];
+                        snprintf(nick_cmd, sizeof nick_cmd, "NICK %s\n", nickname);
+                        send(sockfd, nick_cmd, strlen(nick_cmd), 0);
+                    } else if (strncmp(message, "OK", 2) == 0) {
+                        logged_in = 1;
+                        printf("Name accepted!\n");
+                    } else if (strncmp(message, "ERR", 3) == 0 || strncmp(message, "ERROR", 5) == 0) {
+                        // Handle errors
+                        printf("%s\n", message);
+                        fflush(stdout);
+                        close(sockfd);
+                        exit(EXIT_FAILURE);
+                    } else {
+                        // Unexpected response
+                        printf("Unexpected response from server: %s\n", message);
+                        fflush(stdout);
+                        close(sockfd);
+                        exit(EXIT_FAILURE);
+                    }
+                } else {
+                    if (strncmp(message, "MSG ", 4) == 0) {
+                        // Extract the nick and message
+                        char *nick_start = message + 4;
+                        char *nick_end = strchr(nick_start, ' ');
+                        if (nick_end != NULL) {
+                            *nick_end = '\0';
+                            char *msg_content = nick_end + 1;
+
+                            // Check if the nick is the client's own nickname
+                            if (strcmp(nick_start, nickname) != 0) {
+                                // Print messages from other users
+                                printf("%s: %s\n", nick_start, msg_content);
+                            }
+                            // Else, do not print the message (we already have it)
+                        } else {
+                            // Invalid MSG format; print the raw message
+                            printf("%s\n", message);
+                        }
+                    } else if (strncmp(message, "ERR", 3) == 0 || strncmp(message, "ERROR", 5) == 0) {
+                        // Print error messages
+                        printf("%s\n", message);
+                    }
+                    // Ignore other messages
+                    fflush(stdout);  // Ensure immediate output
+                }
+
+                // Move to the next line
+                line_start = newline_pos + 1;
+            }
+
+            // Move any remaining partial message to the beginning of the buffer
+            recv_buffer_len = strlen(line_start);
+            memmove(recv_buffer, line_start, recv_buffer_len);
+            recv_buffer[recv_buffer_len] = '\0';
         }
 
         // Check for user input
         if (FD_ISSET(STDIN_FILENO, &read_fds)) {
             char input_buf[BUFFER_SIZE];
-            int bytes_read = read(STDIN_FILENO, input_buf, sizeof(input_buf) - 1);
-            if (bytes_read > 0) {
-                input_buf[bytes_read] = '\0';
+            if (fgets(input_buf, sizeof(input_buf), stdin) != NULL) {
+                // Remove newline character
+                input_buf[strcspn(input_buf, "\n")] = '\0';
 
-                // Remove trailing newline characters
-                input_buf[strcspn(input_buf, "\r\n")] = '\0';
-
-                if (strcmp(input_buf, "/quit") == 0) {
+                if (strncmp(input_buf, "/quit", 5) == 0) {
                     break; // Quit the chat
                 }
 
+                // Limit message length to 255 characters
+                if (strlen(input_buf) > 255) {
+                    printf("Message too long. Maximum length is 255 characters.\n");
+                    fflush(stdout);
+                    continue;
+                }
+
                 // Send the message to the server
-                snprintf(buf, sizeof(buf), "MSG %s\n", input_buf);
-                send(sockfd, buf, strlen(buf), 0);
+                char msgbuf[BUFFER_SIZE];
+                snprintf(msgbuf, sizeof(msgbuf), "MSG %s\n", input_buf);
+                send(sockfd, msgbuf, strlen(msgbuf), 0);
             }
         }
     }
